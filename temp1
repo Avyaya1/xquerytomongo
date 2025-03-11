@@ -1,0 +1,401 @@
+import re
+import json
+import sys
+import argparse
+from lxml import etree
+from pyparsing import (Word, alphas, alphanums, Forward, Group, Optional, 
+                      ZeroOrMore, Literal, QuotedString, White, 
+                      Suppress, delimitedList, oneOf, CaselessKeyword)
+
+class XQueryToMongoConverter:
+    def __init__(self):
+        self.mongo_query = {}
+        self.context_path = []
+        self.var_mappings = {}
+        
+    def parse_xquery(self, xquery_string):
+        """Parse an XQuery string and convert it to a MongoDB query"""
+        
+        # Clean and normalize the input
+        xquery_string = xquery_string.strip()
+        
+        # Handle FLWOR expressions
+        if re.search(r'for\s+\$\w+\s+in', xquery_string, re.IGNORECASE):
+            return self._parse_flwor(xquery_string)
+        
+        # Handle simple path expressions
+        elif '/' in xquery_string:
+            return self._parse_path_expression(xquery_string)
+        
+        # Handle simple predicates
+        elif '[' in xquery_string and ']' in xquery_string:
+            return self._parse_predicate_expression(xquery_string)
+        
+        else:
+            raise ValueError(f"Unsupported XQuery syntax: {xquery_string}")
+    
+    def _parse_flwor(self, xquery_string):
+        """Parse a FLWOR expression (For-Let-Where-Order By-Return)"""
+        
+        # Extract the collection name (for clause)
+        for_match = re.search(r'for\s+\$(\w+)\s+in\s+collection\(["\']([^"\']+)["\']\)', xquery_string, re.IGNORECASE)
+        if for_match:
+            var_name = for_match.group(1)
+            collection_name = for_match.group(2)
+            self.var_mappings[var_name] = collection_name
+        else:
+            for_match = re.search(r'for\s+\$(\w+)\s+in\s+db\.collection\(["\']([^"\']+)["\']\)', xquery_string, re.IGNORECASE)
+            if for_match:
+                var_name = for_match.group(1)
+                collection_name = for_match.group(2)
+                self.var_mappings[var_name] = collection_name
+            else:
+                raise ValueError("Could not parse 'for' clause in FLWOR expression")
+        
+        # Extract the where clause
+        where_match = re.search(r'where\s+(.*?)(?:order\s+by|return|\Z)', xquery_string, re.IGNORECASE | re.DOTALL)
+        where_clause = where_match.group(1).strip() if where_match else None
+        
+        # Extract the return clause
+        return_match = re.search(r'return\s+(.*)', xquery_string, re.IGNORECASE | re.DOTALL)
+        return_clause = return_match.group(1).strip() if return_match else None
+        
+        # Parse where clause into MongoDB find query
+        query = {}
+        projection = {}
+        
+        if where_clause:
+            query = self._parse_where_clause(where_clause, var_name)
+        
+        # Parse return clause into MongoDB projection
+        if return_clause:
+            projection = self._parse_return_clause(return_clause, var_name)
+        
+        # Construct the MongoDB command
+        mongo_command = {
+            "collection": collection_name,
+            "operation": "find",
+            "query": query
+        }
+        
+        if projection:
+            mongo_command["projection"] = projection
+        
+        return mongo_command
+    
+    def _parse_where_clause(self, where_clause, context_var):
+        """Parse the where clause into a MongoDB query object"""
+        
+        # Handle multiple conditions with 'and'
+        if ' and ' in where_clause.lower():
+            conditions = where_clause.split(' and ')
+            and_conditions = []
+            for condition in conditions:
+                and_conditions.append(self._parse_single_condition(condition.strip(), context_var))
+            return {"$and": and_conditions}
+        
+        # Handle multiple conditions with 'or'
+        elif ' or ' in where_clause.lower():
+            conditions = where_clause.split(' or ')
+            or_conditions = []
+            for condition in conditions:
+                or_conditions.append(self._parse_single_condition(condition.strip(), context_var))
+            return {"$or": or_conditions}
+        
+        # Handle single condition
+        else:
+            return self._parse_single_condition(where_clause, context_var)
+    
+    def _parse_single_condition(self, condition, context_var):
+        """Parse a single condition from a where clause"""
+        
+        # Equality check
+        eq_match = re.search(r'\$' + context_var + r'/([\w/-]+)\s*=\s*["\']([^"\']+)["\']', condition)
+        if eq_match:
+            field_path = eq_match.group(1).replace('/', '.')
+            value = eq_match.group(2)
+            return {field_path: value}
+        
+        # Greater than
+        gt_match = re.search(r'\$' + context_var + r'/([\w/-]+)\s*>\s*([0-9.]+)', condition)
+        if gt_match:
+            field_path = gt_match.group(1).replace('/', '.')
+            value = float(gt_match.group(2))
+            return {field_path: {"$gt": value}}
+        
+        # Less than
+        lt_match = re.search(r'\$' + context_var + r'/([\w/-]+)\s*<\s*([0-9.]+)', condition)
+        if lt_match:
+            field_path = lt_match.group(1).replace('/', '.')
+            value = float(lt_match.group(2))
+            return {field_path: {"$lt": value}}
+        
+        # Contains text
+        contains_match = re.search(r'contains\(\$' + context_var + r'/([\w/-]+),\s*["\']([^"\']+)["\']\)', condition)
+        if contains_match:
+            field_path = contains_match.group(1).replace('/', '.')
+            value = contains_match.group(2)
+            return {field_path: {"$regex": value, "$options": "i"}}
+        
+        # Exists check
+        exists_match = re.search(r'exists\(\$' + context_var + r'/([\w/-]+)\)', condition)
+        if exists_match:
+            field_path = exists_match.group(1).replace('/', '.')
+            return {field_path: {"$exists": True}}
+        
+        raise ValueError(f"Unsupported condition: {condition}")
+    
+    def _parse_return_clause(self, return_clause, context_var):
+        """Parse the return clause into a MongoDB projection object"""
+        
+        projection = {}
+        
+        # Simple return (variables or specific fields)
+        if return_clause.startswith('$' + context_var):
+            # Return entire document
+            if return_clause == '$' + context_var:
+                return {}
+            
+            # Return specific fields
+            fields_match = re.findall(r'\$' + context_var + r'/([\w/-]+)', return_clause)
+            if fields_match:
+                for field in fields_match:
+                    field_path = field.replace('/', '.')
+                    projection[field_path] = 1
+        
+        # JSON construction
+        curly_match = re.search(r'{\s*(.*?)\s*}', return_clause, re.DOTALL)
+        if curly_match:
+            contents = curly_match.group(1)
+            # Extract field mappings like "new_name": $var/field
+            field_mappings = re.findall(r'["\'](\w+)["\']\s*:\s*\$' + context_var + r'/([\w/-]+)', contents)
+            if field_mappings:
+                # This requires aggregation with $project
+                return {"$project": {
+                    field_name: f"${field_path.replace('/', '.')}" 
+                    for field_name, field_path in field_mappings
+                }}
+        
+        return projection
+    
+    def _parse_path_expression(self, xquery_string):
+        """Parse a simple XPath-like expression"""
+        
+        # Extract collection name and path
+        collection_match = re.search(r'db\.collection\(["\']([^"\']+)["\']\)(.*)', xquery_string)
+        if collection_match:
+            collection_name = collection_match.group(1)
+            path = collection_match.group(2).strip()
+            
+            if path.startswith('/'):
+                path = path[1:]  # Remove leading slash
+                
+            # Simple collection retrieval without conditions
+            if not path or path == '/*':
+                return {
+                    "collection": collection_name,
+                    "operation": "find",
+                    "query": {}
+                }
+                
+            # Path with predicates
+            elif '[' in path and ']' in path:
+                return self._handle_path_with_predicates(collection_name, path)
+                
+            # Simple path to fields
+            else:
+                path_parts = path.split('/')
+                projection = {}
+                
+                for part in path_parts:
+                    if part and part != '*':
+                        projection[part] = 1
+                
+                return {
+                    "collection": collection_name,
+                    "operation": "find",
+                    "query": {},
+                    "projection": projection if projection else None
+                }
+        else:
+            raise ValueError(f"Could not parse collection from: {xquery_string}")
+    
+    def _handle_path_with_predicates(self, collection_name, path):
+        """Handle a path expression with predicates"""
+        
+        # Extract the predicate
+        predicate_match = re.search(r'([^[]+)\[([^\]]+)\]', path)
+        if predicate_match:
+            element_path = predicate_match.group(1).rstrip('/')
+            predicate = predicate_match.group(2)
+            
+            # Parse the predicate into a MongoDB query
+            query = self._parse_predicate(predicate, element_path)
+            
+            # Extract any projection fields
+            remaining_path = re.search(r'\][/]?(.*)', path)
+            projection = None
+            
+            if remaining_path and remaining_path.group(1):
+                projection_path = remaining_path.group(1)
+                projection = {}
+                
+                for part in projection_path.split('/'):
+                    if part and part != '*':
+                        if element_path:
+                            projection[f"{element_path}.{part}"] = 1
+                        else:
+                            projection[part] = 1
+            
+            return {
+                "collection": collection_name,
+                "operation": "find",
+                "query": query,
+                "projection": projection
+            }
+        
+        raise ValueError(f"Could not parse predicate from: {path}")
+    
+    def _parse_predicate(self, predicate, context_path):
+        """Parse a predicate expression into a MongoDB query"""
+        
+        # Equality predicate
+        eq_match = re.search(r'(\w+)\s*=\s*["\']([^"\']+)["\']', predicate)
+        if eq_match:
+            field = eq_match.group(1)
+            value = eq_match.group(2)
+            
+            if context_path:
+                return {f"{context_path}.{field}": value}
+            else:
+                return {field: value}
+        
+        # Numeric comparison
+        num_comp_match = re.search(r'(\w+)\s*([<>]=?)\s*(\d+(?:\.\d+)?)', predicate)
+        if num_comp_match:
+            field = num_comp_match.group(1)
+            operator = num_comp_match.group(2)
+            value = float(num_comp_match.group(3))
+            
+            mongo_operator = {
+                ">": "$gt",
+                ">=": "$gte",
+                "<": "$lt",
+                "<=": "$lte"
+            }.get(operator)
+            
+            if context_path:
+                return {f"{context_path}.{field}": {mongo_operator: value}}
+            else:
+                return {field: {mongo_operator: value}}
+        
+        # text() function
+        text_match = re.search(r'text\(\)\s*=\s*["\']([^"\']+)["\']', predicate)
+        if text_match:
+            value = text_match.group(1)
+            
+            if context_path:
+                return {context_path: value}
+            else:
+                raise ValueError(f"Context path needed for text() function: {predicate}")
+        
+        # contains() function
+        contains_match = re.search(r'contains\((\w+),\s*["\']([^"\']+)["\']\)', predicate)
+        if contains_match:
+            field = contains_match.group(1)
+            value = contains_match.group(2)
+            
+            if context_path:
+                return {f"{context_path}.{field}": {"$regex": value, "$options": "i"}}
+            else:
+                return {field: {"$regex": value, "$options": "i"}}
+        
+        raise ValueError(f"Unsupported predicate: {predicate}")
+    
+    def _parse_predicate_expression(self, xquery_string):
+        """Parse a predicate expression directly"""
+        
+        parts = xquery_string.split('[', 1)
+        collection_path = parts[0].strip()
+        predicate = parts[1].rstrip(']').strip()
+        
+        collection_match = re.search(r'db\.collection\(["\']([^"\']+)["\']\)', collection_path)
+        if collection_match:
+            collection_name = collection_match.group(1)
+            element_path = re.search(r'db\.collection\(["\'][^"\']+["\']\)/?(.*?)$', collection_path)
+            
+            context_path = ""
+            if element_path and element_path.group(1):
+                context_path = element_path.group(1).strip('/')
+            
+            query = self._parse_predicate(predicate, context_path)
+            
+            return {
+                "collection": collection_name,
+                "operation": "find",
+                "query": query
+            }
+        
+        raise ValueError(f"Could not parse collection from: {xquery_string}")
+
+def convert_to_mongo_code(mongo_query):
+    """Convert the parsed MongoDB query object to executable MongoDB code"""
+    
+    result = []
+    
+    collection = mongo_query.get("collection")
+    operation = mongo_query.get("operation", "find")
+    query = mongo_query.get("query", {})
+    projection = mongo_query.get("projection")
+    
+    if operation == "find":
+        code = f'db.{collection}.find({json.dumps(query, indent=2)}'
+        
+        if projection:
+            code += f', {json.dumps(projection, indent=2)}'
+        
+        code += ')'
+        result.append(code)
+    
+    elif operation == "aggregate":
+        pipeline = mongo_query.get("pipeline", [])
+        code = f'db.{collection}.aggregate({json.dumps(pipeline, indent=2)})'
+        result.append(code)
+    
+    return "\n".join(result)
+
+def main():
+    parser = argparse.ArgumentParser(description='Convert XQuery to MongoDB commands')
+    parser.add_argument('--input', '-i', help='Input XQuery string or file')
+    parser.add_argument('--file', '-f', action='store_true', help='Input is a file')
+    parser.add_argument('--output', '-o', help='Output file (defaults to stdout)')
+    
+    args = parser.parse_args()
+    
+    if args.input:
+        if args.file:
+            with open(args.input, 'r') as f:
+                xquery_input = f.read()
+        else:
+            xquery_input = args.input
+    else:
+        xquery_input = sys.stdin.read()
+    
+    converter = XQueryToMongoConverter()
+    
+    try:
+        mongo_query = converter.parse_xquery(xquery_input)
+        mongo_code = convert_to_mongo_code(mongo_query)
+        
+        if args.output:
+            with open(args.output, 'w') as f:
+                f.write(mongo_code)
+        else:
+            print(mongo_code)
+            
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
